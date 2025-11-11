@@ -3,9 +3,16 @@ Adaption to act as the MLP layer using an MoE MLP layer in transformer.
 """
 import torch
 import torch.nn as nn
-from .layers import FMoE
+import tree
+from .layers import FMoE, _fmoe_general_global_forward, ensure_comm, AllGather, Slice
 from .linear import FMoELinear
 from .fastermoe.config import switch_from_env
+
+
+fmoe_faster_schedule = False
+if switch_from_env('FMOE_FASTER_SCHEDULE_ENABLE', False):
+    fmoe_faster_schedule = True
+    from .fastermoe.schedule import _fmoe_general_global_forward
 
 
 class _Expert(nn.Module):
@@ -64,3 +71,97 @@ class FMoETransformerMLP(FMoE):
         inp = inp.reshape(-1, self.d_model)
         output = super().forward(inp)
         return output.reshape(original_shape)
+
+
+class SyntaxGuidedFMoETransformerMLP(FMoETransformerMLP):
+    r"""
+    A variant of FMoETransformerMLP that accepts separate inputs for the
+    experts and for the gate. Use `forward(expert_input, gate_input)` where
+    `expert_input` is the tensor fed to experts and `gate_input` is the tensor
+    used to compute routing scores.
+    """
+
+    def forward(self, expert_input: torch.Tensor, gate_input: torch.Tensor):
+        r"""
+        This module wraps up the FMoE module with reshape, residual and layer
+        normalization, but uses separate inputs for experts and gate.
+        """
+        original_shape = expert_input.shape
+        expert_flat = expert_input.reshape(-1, self.d_model)
+        gate_flat = gate_input.reshape(-1, self.d_model)
+
+        # Ensure communication tensors are prepared (as in FMoE.forward)
+        if self.world_size > 1:
+            ensure_comm(expert_flat, self.moe_group)
+            ensure_comm(gate_flat, self.moe_group)
+
+        # Handle model slicing if enabled (mirror FMoE.forward behavior)
+        if self.slice_size > 1:
+            expert_flat = Slice.apply(expert_flat, self.slice_rank, self.slice_size, self.slice_group)
+            gate_flat = Slice.apply(gate_flat, self.slice_rank, self.slice_size, self.slice_group)
+
+        # Compute gate top-k indices and gate scores from gate_input
+        gate_top_k_idx, gate_score = self.gate(gate_flat)
+
+        # Perform the global MoE forward using the precomputed gate indices
+        fwd = _fmoe_general_global_forward(
+            expert_flat,
+            gate_top_k_idx,
+            self.expert_fn_single if fmoe_faster_schedule else self.expert_fn,
+            self.num_expert,
+            self.world_size,
+            experts=self.experts
+        )
+
+        # Recover / reshape outputs similar to FMoE.forward
+        if self.mask is not None and self.mask_dict is not None:
+            def recover_func(tensor):
+                dim = tensor.shape[-1]
+                tensor = tensor.view(-1, self.top_k, dim)
+                x = torch.zeros(
+                    self.mask.shape[0],
+                    self.top_k,
+                    dim,
+                    device=tensor.device,
+                    dtype=tensor.dtype,
+                )
+                x[self.mask == 0] = tensor
+                for k, v in self.mask_dict.items():
+                    x[self.mask == k] = v
+                return x
+
+            moe_outp = tree.map_structure(recover_func, fwd)
+        else:
+            def view_func(tensor):
+                dim = tensor.shape[-1]
+                tensor = tensor.view(-1, self.top_k, dim)
+                return tensor
+
+            moe_outp = tree.map_structure(view_func, fwd)
+
+        # Gate_score shape -> (B*T, 1, top_k) to bmm with moe_outp
+        gate_score = gate_score.view(-1, 1, self.top_k)
+
+        def bmm_func(tensor):
+            dim = tensor.shape[-1]
+            tensor = torch.bmm(gate_score, tensor).reshape(-1, dim)
+            return tensor
+
+        moe_outp = tree.map_structure(bmm_func, moe_outp)
+
+        # If sliced, gather across slices
+        if self.slice_size > 1:
+            def all_gather_func(tensor):
+                return AllGather.apply(tensor, self.slice_rank, self.slice_size, self.slice_group)
+
+            moe_outp = tree.map_structure(all_gather_func, moe_outp)
+
+        # Final sanity check and reshape back to original
+        moe_outp_batch_size = tree.flatten(tree.map_structure(lambda tensor: tensor.shape[0], moe_outp))
+        assert all([batch_size == moe_outp_batch_size[0] for batch_size in moe_outp_batch_size]), "MoE outputs must have the same batch size"
+
+        # Reshape returned tensors to original shape
+        def final_view(tensor):
+            return tensor.reshape(original_shape)
+
+        return tree.map_structure(final_view, moe_outp)
