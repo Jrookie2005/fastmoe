@@ -38,6 +38,46 @@ class _Expert(nn.Module):
         return x
 
 
+class SharedExpert(nn.Module):
+    r"""
+    Shared expert, can be implemented with either nn.Linear or FMoELinear.
+    """
+
+    def __init__(self, d_model, d_hidden, activation, use_fmoe_linear=False):
+        super().__init__()
+        self.use_fmoe_linear = use_fmoe_linear
+        
+        if use_fmoe_linear:
+            # Use FMoELinear with num_expert=1 for consistency with other experts
+            self.htoh4 = FMoELinear(1, d_model, d_hidden, bias=True, rank=0)
+            self.h4toh = FMoELinear(1, d_hidden, d_model, bias=True, rank=0)
+        else:
+            # Use standard nn.Linear (current approach)
+            self.htoh4 = nn.Linear(d_model, d_hidden)
+            self.h4toh = nn.Linear(d_hidden, d_model)
+        
+        self.activation = activation
+
+    def forward(self, inp):
+        r"""
+        Forward pass for shared expert.
+        """
+        if self.use_fmoe_linear:
+            # For FMoELinear, we need to create a dummy expert count tensor
+            batch_size = inp.shape[0]
+            fwd_expert_count = torch.tensor([batch_size], device=inp.device, dtype=torch.long)
+            
+            x = self.htoh4(inp, fwd_expert_count)
+            x = self.activation(x)
+            x = self.h4toh(x, fwd_expert_count)
+        else:
+            x = self.htoh4(inp)
+            x = self.activation(x)
+            x = self.h4toh(x)
+        return x
+
+
+
 class FMoETransformerMLP(FMoE):
     r"""
     A complete MoE MLP module in a Transformer block.
@@ -53,14 +93,29 @@ class FMoETransformerMLP(FMoE):
         activation=torch.nn.GELU(),
         expert_dp_comm="none",
         expert_rank=0,
+        expert_group=1,
         **kwargs
     ):
+        # Calculate fine-grained dimensions based on expert_group
+        self.expert_group = expert_group
+        experts_per_group = num_expert // expert_group
+        d_hidden_per_expert = d_hidden // experts_per_group if expert_group > 1 else d_hidden
+        
         def one_expert(d_model):
-            return _Expert(1, d_model, d_hidden, activation, rank=0)
+            # Each expert uses fine-grained d_hidden dimensions
+            return _Expert(1, d_model, d_hidden_per_expert, activation, rank=0)
         
         expert = one_expert
         super().__init__(num_expert=num_expert, d_model=d_model, expert=expert, **kwargs)
         self.mark_parallel_comm(expert_dp_comm)
+        
+        # SharedExpert always uses full d_hidden dimensions (reuses BART FFN weights)
+        # You can set use_fmoe_linear=True if you want architectural consistency
+        self.shared_expert = SharedExpert(d_model, d_hidden, activation, use_fmoe_linear=False)
+        
+        # Store dimensions for reference
+        self.d_hidden = d_hidden  # Full hidden dimension  
+        self.d_hidden_per_expert = d_hidden_per_expert  # Per-expert hidden dimension
 
     def forward(self, inp: torch.Tensor):
         r"""
@@ -68,8 +123,10 @@ class FMoETransformerMLP(FMoE):
         normalization.
         """
         original_shape = inp.shape
-        inp = inp.reshape(-1, self.d_model)
-        output = super().forward(inp)
+        inp_flat = inp.reshape(-1, self.d_model)
+        routed_output = super().forward(inp_flat)
+        shared_output = self.shared_expert(inp_flat)
+        output = routed_output + shared_output
         return output.reshape(original_shape)
 
 
@@ -159,6 +216,10 @@ class SyntaxGuidedFMoETransformerMLP(FMoETransformerMLP):
         # Final sanity check and reshape back to original
         moe_outp_batch_size = tree.flatten(tree.map_structure(lambda tensor: tensor.shape[0], moe_outp))
         assert all([batch_size == moe_outp_batch_size[0] for batch_size in moe_outp_batch_size]), "MoE outputs must have the same batch size"
+
+        # Add shared expert output
+        shared_output = self.shared_expert(expert_flat)
+        moe_outp = tree.map_structure(lambda x: x + shared_output, moe_outp)
 
         # Reshape returned tensors to original shape
         def final_view(tensor):
